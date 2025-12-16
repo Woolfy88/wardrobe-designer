@@ -1,260 +1,285 @@
 import streamlit as st
-import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle, Polygon
+from matplotlib.patches import Rectangle
+from dataclasses import dataclass
+from typing import List
 
+# ----------------------------
+# Page config
+# ----------------------------
 st.set_page_config(page_title="Wardrobe Designer", layout="wide")
-st.title("Wardrobe Designer (Option 1)")
 
 # ----------------------------
-# Helpers
+# Data model
 # ----------------------------
-def mm_to_m(x_mm: float) -> float:
-    return x_mm / 1000.0
+@dataclass
+class Bay:
+    width_mm: int
+    layout: str  # "Single" | "Drawer tower" | "Double"
 
-def clamp_int(x, lo, hi):
-    return max(lo, min(hi, int(x)))
+# ----------------------------
+# Session state helpers (robust)
+# ----------------------------
+def _is_int_list(x, n=None) -> bool:
+    if not isinstance(x, list):
+        return False
+    if n is not None and len(x) != n:
+        return False
+    return all(isinstance(v, int) for v in x)
 
-def ensure_state(num_bays: int):
-    if "bay_types" not in st.session_state or len(st.session_state["bay_types"]) != num_bays:
-        st.session_state["bay_types"] = ["Single"] * num_bays
+def _is_str_list(x, n=None) -> bool:
+    if not isinstance(x, list):
+        return False
+    if n is not None and len(x) != n:
+        return False
+    return all(isinstance(v, str) for v in x)
 
-    if "bay_widths" not in st.session_state or len(st.session_state["bay_widths"]) != num_bays:
-        st.session_state["bay_widths"] = None  # means "auto"
+def ensure_state(num_bays: int, default_width: int):
+    # Ensure bay widths list is valid
+    bw = st.session_state.get("bay_widths")
+    if not _is_int_list(bw, n=num_bays):
+        st.session_state["bay_widths"] = [default_width] * num_bays
 
-def split_widths(total_w_mm: int, num_bays: int, custom: list[int] | None):
-    if custom and len(custom) == num_bays and sum(custom) > 0:
-        # Scale to exactly total width, preserving proportions
-        scaled = np.array(custom, dtype=float)
-        scaled = scaled / scaled.sum() * total_w_mm
-        rounded = np.floor(scaled).astype(int)
-        diff = total_w_mm - int(rounded.sum())
-        # distribute remainder
-        for i in range(abs(diff)):
-            rounded[i % num_bays] += 1 if diff > 0 else -1
-        return rounded.tolist()
+    # Ensure bay layouts list is valid
+    bl = st.session_state.get("bay_layouts")
+    if not _is_str_list(bl, n=num_bays):
+        st.session_state["bay_layouts"] = ["Single"] * num_bays
 
-    # Auto: equal widths
-    base = total_w_mm // num_bays
-    widths = [base] * num_bays
-    rem = total_w_mm - base * num_bays
-    for i in range(rem):
-        widths[i] += 1
-    return widths
+def build_bays() -> List[Bay]:
+    return [Bay(width_mm=w, layout=layout)
+            for w, layout in zip(st.session_state["bay_widths"], st.session_state["bay_layouts"])]
 
-def draw_elevation(total_w_mm, total_h_mm, bay_widths_mm, bay_types, view_mode, show_dims):
-    W = mm_to_m(total_w_mm)
-    H = mm_to_m(total_h_mm)
+# ----------------------------
+# Drawing utilities
+# ----------------------------
+def draw_elevation(bays: List[Bay], height_mm: int, depth_mm: int, customer_view: bool):
+    """
+    2D front elevation: bays drawn left-to-right with internals indicated.
+    customer_view=True removes "technical" lines and keeps it cleaner.
+    """
+    total_width = sum(b.width_mm for b in bays)
+    # Scale figure size based on wardrobe size (inches-ish)
+    fig_w = max(6.5, min(16.0, total_width / 250))
+    fig_h = max(4.0, min(10.0, height_mm / 300))
 
-    fig, ax = plt.subplots(figsize=(min(14, max(8, W * 4.0)), min(8, max(4.5, H * 2.0))))
-    ax.set_aspect("equal")
-    ax.axis("off")
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
     # Outer carcass
-    ax.add_patch(Rectangle((0, 0), W, H, fill=False, linewidth=2))
+    ax.add_patch(Rectangle((0, 0), total_width, height_mm, fill=False, linewidth=2))
 
-    # Bay lines + internals
-    x = 0.0
-    for idx, (bw_mm, btype) in enumerate(zip(bay_widths_mm, bay_types), start=1):
-        bw = mm_to_m(bw_mm)
+    # Vertical bay dividers + internals
+    x = 0
+    for idx, bay in enumerate(bays):
+        # Bay outline (optional inner box)
+        ax.add_patch(Rectangle((x, 0), bay.width_mm, height_mm, fill=False, linewidth=1.5))
 
-        # Vertical bay boundary (except at far left which is outer frame)
-        if x > 0:
-            ax.plot([x, x], [0, H], linewidth=1.5)
+        # Divider line at right edge (except last)
+        if idx < len(bays) - 1:
+            ax.plot([x + bay.width_mm, x + bay.width_mm], [0, height_mm], linewidth=2)
 
-        # Internals (no text labels for hanging)
-        # Use simple visual cues:
-        # - Single: one rail line
-        # - Double: two rail lines
-        # - Drawer Tower: drawer fronts as horizontal lines
+        # Internals
+        if bay.layout == "Drawer tower":
+            # Drawer tower centered, with drawers stacked
+            tower_w = int(bay.width_mm * 0.55)
+            tower_x = x + (bay.width_mm - tower_w) / 2
+            base_y = 0
+            tower_h = int(height_mm * 0.60)
 
-        pad = 0.03 * min(bw, H)  # visual padding
-        left = x + pad
-        right = x + bw - pad
+            ax.add_patch(Rectangle((tower_x, base_y), tower_w, tower_h, fill=False, linewidth=1.5))
 
-        if btype == "Single":
-            # one rail line near upper third
-            rail_y = H * 0.72
-            ax.plot([left, right], [rail_y, rail_y], linewidth=2)
+            # Draw 4-5 drawer fronts
+            drawer_count = 5
+            step = tower_h / drawer_count
+            for d in range(1, drawer_count):
+                y = base_y + d * step
+                ax.plot([tower_x, tower_x + tower_w], [y, y], linewidth=1)
 
-        elif btype == "Double":
-            # two rails
-            rail_y1 = H * 0.72
-            rail_y2 = H * 0.45
-            ax.plot([left, right], [rail_y1, rail_y1], linewidth=2)
-            ax.plot([left, right], [rail_y2, rail_y2], linewidth=2)
+            # Optional top shelf line above tower
+            if not customer_view:
+                shelf_y = tower_h + int(height_mm * 0.05)
+                ax.plot([x + 40, x + bay.width_mm - 40], [shelf_y, shelf_y], linewidth=1)
 
-        elif btype == "Drawer Tower":
-            # stack of drawers from lower section up to mid
-            bottom = H * 0.05
-            top = H * 0.75
-            # outer drawer "box"
-            ax.add_patch(Rectangle((x + pad, bottom), bw - 2 * pad, top - bottom, fill=False, linewidth=1.5))
-            # drawer lines
-            n_drawers = 5 if view_mode == "Customer view" else 6
-            ys = np.linspace(bottom, top, n_drawers + 1)
-            for y in ys[1:-1]:
-                ax.plot([x + pad, x + bw - pad], [y, y], linewidth=1)
+        elif bay.layout == "Double":
+            # Two hanging zones (no labels per request)
+            top_y = int(height_mm * 0.58)
+            mid_y = int(height_mm * 0.12)
 
-        # Installer view: subtle bay index markers (optional)
-        if view_mode == "Installer view":
-            ax.text(x + bw / 2, H + (H * 0.02), f"Bay {idx}", ha="center", va="bottom", fontsize=10)
+            # Suggest rails as thin lines
+            ax.plot([x + 40, x + bay.width_mm - 40], [top_y, top_y], linewidth=1.5)
+            ax.plot([x + 40, x + bay.width_mm - 40], [mid_y + int(height_mm * 0.20), mid_y + int(height_mm * 0.20)], linewidth=1.5)
 
-        # Dimensions labels (optional)
-        if show_dims:
-            ax.text(x + bw / 2, -H * 0.04, f"{bw_mm}mm", ha="center", va="top", fontsize=9)
+            # Optional small shelf line between zones (installer-ish)
+            if not customer_view:
+                split_y = int(height_mm * 0.50)
+                ax.plot([x + 40, x + bay.width_mm - 40], [split_y, split_y], linewidth=1)
 
-        x += bw
+        else:
+            # "Single" (plain): just one rail line (no label)
+            rail_y = int(height_mm * 0.62)
+            ax.plot([x + 40, x + bay.width_mm - 40], [rail_y, rail_y], linewidth=1.5)
 
-    # last right boundary line is outer frame already
+            # Optional: a top shelf line for installer view
+            if not customer_view:
+                shelf_y = int(height_mm * 0.85)
+                ax.plot([x + 40, x + bay.width_mm - 40], [shelf_y, shelf_y], linewidth=1)
 
-    # Overall dims (optional)
-    if show_dims:
-        ax.text(W / 2, H + H * 0.06, f"Overall: {total_w_mm}mm x {total_h_mm}mm", ha="center", va="bottom", fontsize=10)
+        # Bay width annotation (installer view only)
+        if not customer_view:
+            ax.text(x + bay.width_mm / 2, -height_mm * 0.035, f"{bay.width_mm}mm",
+                    ha="center", va="top", fontsize=10)
 
-    ax.set_xlim(-W * 0.03, W * 1.03)
-    ax.set_ylim(-H * 0.10, H * 1.12)
-    return fig
+        x += bay.width_mm
 
-def draw_isometric(total_w_mm, total_h_mm, depth_mm, bay_widths_mm, bay_types, view_mode):
-    # Fake 3D: draw front face + a shifted "top" and "side" to imply depth
-    W = mm_to_m(total_w_mm)
-    H = mm_to_m(total_h_mm)
-    D = mm_to_m(depth_mm)
-
-    # isometric offset (tweakable)
-    ox = D * 0.55
-    oy = D * 0.35
-
-    fig, ax = plt.subplots(figsize=(12, 7))
-    ax.set_aspect("equal")
+    # Customer view: remove axes, keep clean
+    ax.set_xlim(0, total_width)
+    ax.set_ylim(-height_mm * 0.08, height_mm)
+    ax.set_aspect("equal", adjustable="box")
     ax.axis("off")
 
-    # Front face rectangle
-    front = Rectangle((0, 0), W, H, fill=False, linewidth=2)
-    ax.add_patch(front)
+    title = "Wardrobe (Customer View)" if customer_view else "Wardrobe (Installer View)"
+    ax.set_title(title, fontsize=14, pad=12)
 
-    # Top face polygon
-    top = Polygon([(0, H), (W, H), (W + ox, H + oy), (0 + ox, H + oy)], closed=True, fill=False, linewidth=1.5)
-    ax.add_patch(top)
+    return fig
 
-    # Side face polygon
-    side = Polygon([(W, 0), (W, H), (W + ox, H + oy), (W + ox, 0 + oy)], closed=True, fill=False, linewidth=1.5)
-    ax.add_patch(side)
+def draw_isometric(bays: List[Bay], height_mm: int, depth_mm: int, customer_view: bool):
+    """
+    Fake-3D isometric: front face + top/depth offset.
+    Still matplotlib, so it stays simple and fast.
+    """
+    total_width = sum(b.width_mm for b in bays)
 
-    # Bay lines on front + echoed on top
-    x = 0.0
-    for idx, (bw_mm, btype) in enumerate(zip(bay_widths_mm, bay_types), start=1):
-        bw = mm_to_m(bw_mm)
-        if x > 0:
-            ax.plot([x, x], [0, H], linewidth=1.2)
-            ax.plot([x, x + ox], [H, H + oy], linewidth=1.0)
+    # Isometric offsets (in mm units for drawing)
+    dx = int(depth_mm * 0.55)
+    dy = int(depth_mm * 0.30)
 
-        # internal cues on the front (still no text labels)
-        pad = 0.03 * min(bw, H)
-        left = x + pad
-        right = x + bw - pad
+    fig_w = max(7.0, min(16.0, (total_width + dx) / 260))
+    fig_h = max(4.5, min(10.0, (height_mm + dy) / 320))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
-        if btype == "Single":
-            rail_y = H * 0.72
-            ax.plot([left, right], [rail_y, rail_y], linewidth=2)
-        elif btype == "Double":
-            rail_y1 = H * 0.72
-            rail_y2 = H * 0.45
-            ax.plot([left, right], [rail_y1, rail_y1], linewidth=2)
-            ax.plot([left, right], [rail_y2, rail_y2], linewidth=2)
-        elif btype == "Drawer Tower":
-            bottom = H * 0.05
-            top_y = H * 0.75
-            ax.add_patch(Rectangle((x + pad, bottom), bw - 2 * pad, top_y - bottom, fill=False, linewidth=1.2))
-            n_drawers = 5 if view_mode == "Customer view" else 6
-            ys = np.linspace(bottom, top_y, n_drawers + 1)
-            for y in ys[1:-1]:
-                ax.plot([x + pad, x + bw - pad], [y, y], linewidth=0.9)
+    # Front rectangle
+    ax.add_patch(Rectangle((0, 0), total_width, height_mm, fill=False, linewidth=2))
 
-        # Installer view: bay id above
-        if view_mode == "Installer view":
-            ax.text(x + bw / 2, H + oy + (H * 0.03), f"Bay {idx}", ha="center", va="bottom", fontsize=9)
+    # "Top" outline (shifted)
+    ax.plot([0, dx, total_width + dx, total_width, 0],
+            [height_mm, height_mm + dy, height_mm + dy, height_mm, height_mm],
+            linewidth=2)
 
-        x += bw
+    # Side outline
+    ax.plot([total_width, total_width + dx],
+            [0, dy],
+            linewidth=2)
+    ax.plot([total_width + dx, total_width + dx],
+            [dy, height_mm + dy],
+            linewidth=2)
 
-    ax.set_xlim(-W * 0.05, W + ox + W * 0.10)
-    ax.set_ylim(-H * 0.05, H + oy + H * 0.15)
+    # Bay dividers on front + top
+    x = 0
+    for i, bay in enumerate(bays[:-1]):
+        x += bay.width_mm
+        ax.plot([x, x], [0, height_mm], linewidth=1.5)
+        ax.plot([x, x + dx], [height_mm, height_mm + dy], linewidth=1.5)
+
+    # Light internal hints (customer view = less busy)
+    if not customer_view:
+        x = 0
+        for bay in bays:
+            # show one internal line per bay
+            ax.plot([x + 40, x + bay.width_mm - 40], [int(height_mm * 0.75), int(height_mm * 0.75)], linewidth=1)
+            x += bay.width_mm
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.axis("off")
+
+    title = "Isometric (Customer View)" if customer_view else "Isometric (Installer View)"
+    ax.set_title(title, fontsize=14, pad=12)
+
+    ax.set_xlim(-depth_mm * 0.1, total_width + dx + depth_mm * 0.2)
+    ax.set_ylim(-height_mm * 0.05, height_mm + dy + height_mm * 0.1)
+
     return fig
 
 # ----------------------------
-# Sidebar controls
+# UI
 # ----------------------------
-st.sidebar.header("Wardrobe Setup")
+st.title("Wardrobe Designer")
 
-view_mode = st.sidebar.radio("View mode", ["Customer view", "Installer view"], horizontal=False)
-render_mode = st.sidebar.radio("Render", ["2D elevation", "Isometric (fake 3D)"], horizontal=False)
-
-total_w_mm = st.sidebar.number_input("Overall width (mm)", min_value=600, max_value=6000, value=2400, step=10)
-total_h_mm = st.sidebar.number_input("Overall height (mm)", min_value=1800, max_value=3000, value=2400, step=10)
-depth_mm = st.sidebar.number_input("Depth (mm)", min_value=300, max_value=800, value=600, step=10)
-
-num_bays = clamp_int(st.sidebar.number_input("Number of bays", min_value=1, max_value=8, value=4, step=1), 1, 8)
-ensure_state(num_bays)
-
-st.sidebar.divider()
-st.sidebar.subheader("Bays")
-
-# Bay options per bay
-bay_types = []
-for i in range(num_bays):
-    bay_types.append(
-        st.sidebar.selectbox(
-            f"Bay {i+1} type",
-            ["Single", "Double", "Drawer Tower"],
-            index=["Single", "Double", "Drawer Tower"].index(st.session_state["bay_types"][i]),
-            key=f"bay_type_{i}",
-        )
-    )
-
-# Persist
-st.session_state["bay_types"] = bay_types
-
-custom_widths_toggle = st.sidebar.checkbox("Custom bay widths", value=False)
-custom_widths = None
-if custom_widths_toggle:
-    custom_widths = []
-    st.sidebar.caption("Enter bay widths in mm (they will scale to fit overall width).")
-    for i in range(num_bays):
-        custom_widths.append(
-            st.sidebar.number_input(f"Bay {i+1} width (mm)", min_value=200, max_value=3000, value=total_w_mm // num_bays, step=10, key=f"bay_w_{i}")
-        )
-
-show_dims = False
-if view_mode == "Installer view":
-    show_dims = st.sidebar.checkbox("Show dimensions", value=True)
-
-# Compute bay widths
-bay_widths_mm = split_widths(int(total_w_mm), num_bays, custom_widths)
-
-# ----------------------------
-# Main layout
-# ----------------------------
-colA, colB = st.columns([2, 1], gap="large")
-
-with colA:
-    st.subheader("Preview")
-
-    if render_mode == "2D elevation":
-        fig = draw_elevation(int(total_w_mm), int(total_h_mm), bay_widths_mm, bay_types, view_mode, show_dims)
-        st.pyplot(fig, use_container_width=True)
-    else:
-        fig = draw_isometric(int(total_w_mm), int(total_h_mm), int(depth_mm), bay_widths_mm, bay_types, view_mode)
-        st.pyplot(fig, use_container_width=True)
-
-with colB:
-    st.subheader("Summary")
-
-    st.write(f"**Overall:** {int(total_w_mm)}mm (W) × {int(total_h_mm)}mm (H) × {int(depth_mm)}mm (D)")
-    st.write(f"**Bays:** {num_bays}")
-
-    for i, (w, t) in enumerate(zip(bay_widths_mm, bay_types), start=1):
-        st.write(f"- Bay {i}: {w}mm — {t}")
+with st.sidebar:
+    st.header("Wardrobe")
+    total_height = st.number_input("Height (mm)", min_value=1800, max_value=3000, value=2400, step=10)
+    depth = st.number_input("Depth (mm)", min_value=400, max_value=800, value=600, step=10)
 
     st.divider()
-    st.info("No pricing included. This is purely a layout/design visual tied to your inputs.")
+    num_bays = st.number_input("Number of bays", min_value=1, max_value=8, value=4, step=1)
+
+    st.divider()
+    view_mode = st.radio("View mode", ["Customer view", "Installer view"], index=0)
+    customer_view = (view_mode == "Customer view")
+
+    show_isometric = st.checkbox("Show fake-3D isometric", value=False)
+
+    st.divider()
+    equal_widths = st.checkbox("Keep bays equal width", value=True)
+
+# Setup state safely
+default_bay_width = 600
+ensure_state(int(num_bays), default_bay_width)
+
+# Layout editors
+st.subheader("Bay setup")
+
+# If equal widths, expose one control and apply to all
+if equal_widths:
+    w = st.number_input("Bay width (mm)", min_value=300, max_value=1200,
+                        value=int(st.session_state["bay_widths"][0]), step=10)
+    st.session_state["bay_widths"] = [int(w)] * int(num_bays)
+
+cols = st.columns(int(num_bays))
+layouts = ["Single", "Drawer tower", "Double"]
+
+for i in range(int(num_bays)):
+    with cols[i]:
+        st.markdown(f"**Bay {i+1}**")
+        if not equal_widths:
+            st.session_state["bay_widths"][i] = int(st.number_input(
+                "Width (mm)", min_value=300, max_value=1200,
+                value=int(st.session_state["bay_widths"][i]), step=10, key=f"w_{i}"
+            ))
+        st.session_state["bay_layouts"][i] = st.selectbox(
+            "Internal", layouts,
+            index=layouts.index(st.session_state["bay_layouts"][i]) if st.session_state["bay_layouts"][i] in layouts else 0,
+            key=f"layout_{i}"
+        )
+
+bays = build_bays()
+
+# Render outputs
+st.divider()
+left, right = st.columns([2, 1], vertical_alignment="top")
+
+with left:
+    st.subheader("Design preview")
+    fig = draw_elevation(bays=bays, height_mm=int(total_height), depth_mm=int(depth), customer_view=customer_view)
+    st.pyplot(fig, clear_figure=True)
+
+    if show_isometric:
+        fig_iso = draw_isometric(bays=bays, height_mm=int(total_height), depth_mm=int(depth), customer_view=customer_view)
+        st.pyplot(fig_iso, clear_figure=True)
+
+with right:
+    st.subheader("Summary")
+    st.write(f"**Total width:** {sum(b.width_mm for b in bays)} mm")
+    st.write(f"**Height:** {int(total_height)} mm")
+    st.write(f"**Depth:** {int(depth)} mm")
+
+    st.divider()
+    st.write("**Bays:**")
+    for idx, bay in enumerate(bays, start=1):
+        st.write(f"- Bay {idx}: {bay.width_mm} mm — {bay.layout}")
+
+    st.divider()
+    if st.button("Reset designer"):
+        # Clear only our keys
+        for k in ["bay_widths", "bay_layouts"]:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.rerun()
